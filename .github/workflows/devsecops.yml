@@ -1,0 +1,497 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, test]
+  pull_request:
+    branches: [main, test]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+      - run: chmod +x ./mvnw
+      - name: Run tests
+        run: ./mvnw -B clean test
+      - name: Package
+        run: ./mvnw -B package -DskipTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+
+  sca:
+    name: SCA (Trivy for Dependencies)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+  
+      - name: Setup Java for Maven
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+  
+      - name: Build with Maven to generate dependencies
+        run: |
+          chmod +x ./mvnw
+          ./mvnw -B compile dependency:tree
+  
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-sca-${{ github.run_id }}
+  
+      - name: Run Trivy vulnerability scanner for dependencies
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-deps-report.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+  
+      - name: Upload Trivy SCA report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-deps-report
+          path: trivy-deps-report.sarif
+  
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-deps-report.sarif
+
+  sast:
+    name: SAST (SonarCloud)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+  
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+  
+      - run: chmod +x ./mvnw
+  
+      - name: SonarCloud Scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          ./mvnw -B verify sonar:sonar \
+            -Dsonar.projectKey=AT180410_student-management \
+            -Dsonar.organization=at180410 \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.token=${SONAR_TOKEN} \
+            -Dsonar.branch.name=${GITHUB_REF_NAME} \
+            -Dsonar.sources=src/main/java,src/main/resources \
+            -Dsonar.tests=src/test/java \
+            -Dsonar.junit.reportPaths=target/surefire-reports \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.qualitygate.wait=true
+
+  container-scan:
+    name: Container Scan (Trivy for Docker Image)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+  
+      - name: Build Docker image
+        run: docker build -t student-management:latest .
+  
+      # Cache Trivy DB 
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-container-${{ github.run_id }}
+  
+      - name: Run Trivy container scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: student-management:latest
+          format: 'sarif'
+          output: 'trivy-container-report.sarif'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+  
+      - name: Upload Trivy Container report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-container-report
+          path: trivy-container-report.sarif
+  
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-container-report.sarif
+
+  iac-scan:
+    name: IaC Security (Checkov)
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checkov (IoC scan)
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          output_format: cli,sarif
+          output_file_path: ./checkov-results.sarif
+          soft_fail: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checkov-report
+          path: checkov-results.sarif
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: checkov-results.sarif
+
+# 🔒SECURITY GATE - CORRECT SEVERITY PARSING
+  security-gate:
+    name: 🔒 Security Gate
+    runs-on: ubuntu-latest
+    needs: [sca, sast, container-scan, iac-scan]
+    outputs:
+      passed: ${{ steps.check-gate.outputs.passed }}
+      critical_count: ${{ steps.check-gate.outputs.critical_count }}
+      high_count: ${{ steps.check-gate.outputs.high_count }}
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq bc
+  
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: trivy-*-report
+          path: reports
+          merge-multiple: true
+  
+      - uses: actions/download-artifact@v4
+        with:
+          name: checkov-report
+          path: reports/iac
+  
+      - name: Debug SARIF severity fields
+        run: |
+          echo "🔍 Debugging SARIF severity fields..."
+          if [ -f "reports/trivy-deps-report.sarif" ]; then
+            echo "=== First 3 results with all severity fields ==="
+            jq '.runs[0].results[0:3] | .[] | {ruleId, level, properties}' "reports/trivy-deps-report.sarif" || echo "Cannot parse"
+          fi
+  
+      - name: Analyze Security Reports - CORRECT SEVERITY
+        id: check-gate
+        run: |
+          set -e
+          echo "🔒 Analyzing Security Reports..."
+          FAIL=0
+          TOTAL_CRITICAL=0
+          TOTAL_HIGH=0
+          VULNERABILITIES=""
+          
+          parse_sarif() {
+            local file=$1
+            local tool=$2
+            
+            if [ ! -f "$file" ]; then
+              echo "⚠️ No $tool report found: $file"
+              return
+            fi
+            
+            echo "📊 Analyzing $tool report..."
+            
+            local critical_count=0
+            local high_count=0
+            local vuln_details=""
+            
+            # Parse each result with CORRECT severity mapping
+            while IFS= read -r result; do
+              if [ -n "$result" ]; then
+                local ruleId=$(echo "$result" | jq -r '.ruleId // "unknown"' 2>/dev/null)
+                local message=$(echo "$result" | jq -r '.message.text // "No description"' 2>/dev/null | head -100)
+                
+                # CORRECT SEVERITY EXTRACTION - Based on actual Trivy output
+                # Trivy stores severity in the message text, not in properties
+                local severity="UNKNOWN"
+                
+                # Extract severity from message text 
+                if echo "$message" | grep -qi "Severity: CRITICAL"; then
+                  severity="CRITICAL"
+                elif echo "$message" | grep -qi "Severity: HIGH"; then
+                  severity="HIGH" 
+                elif echo "$message" | grep -qi "Severity: MEDIUM"; then
+                  severity="MEDIUM"
+                elif echo "$message" | grep -qi "Severity: LOW"; then
+                  severity="LOW"
+                else
+                  # Fallback: try to extract from properties or level
+                  severity=$(echo "$result" | jq -r '
+                    .level? // 
+                    .properties.severity? // 
+                    "UNKNOWN"
+                  ' 2>/dev/null | tr '[:lower:]' '[:upper:]')
+                fi
+                
+                # DEBUG: Print severity detection
+                echo "DEBUG: $ruleId - Severity: $severity"
+                
+                # CORRECT COUNTING - Only count actual CRITICAL as critical
+                case "$severity" in
+                  "CRITICAL")
+                    critical_count=$((critical_count + 1))
+                    vuln_details+="🚨 CRITICAL ($tool): $ruleId - $message"$'\n'
+                    ;;
+                  "HIGH")
+                    high_count=$((high_count + 1))
+                    vuln_details+="⚠️ HIGH ($tool): $ruleId - $message"$'\n'
+                    ;;
+                  "MEDIUM"|"LOW"|"UNKNOWN")
+                    # Ignore for gate purposes, but could log if needed
+                    ;;
+                esac
+              fi
+            done < <(jq -c '.runs[0].results[]?' "$file" 2>/dev/null || echo "")
+            
+            echo "🔍 $tool - TRUE CRITICAL: $critical_count, HIGH: $high_count"
+            TOTAL_CRITICAL=$((TOTAL_CRITICAL + critical_count))
+            TOTAL_HIGH=$((TOTAL_HIGH + high_count))
+            VULNERABILITIES+="$vuln_details"
+            
+            if [ "$critical_count" -gt 0 ]; then
+              FAIL=1
+            fi
+          }
+          
+          # Analyze all reports
+          parse_sarif "reports/trivy-deps-report.sarif" "SCA"
+          parse_sarif "reports/trivy-container-report.sarif" "Container"
+          parse_sarif "reports/iac/checkov-results.sarif" "IaC"
+          
+          echo "📊 TRUE SECURITY SUMMARY:"
+          echo "========================================"
+          echo "🚨 ACTUAL CRITICAL Vulnerabilities: $TOTAL_CRITICAL"
+          echo "⚠️ HIGH Vulnerabilities: $TOTAL_HIGH"
+          echo "========================================"
+          
+          if [ -n "$VULNERABILITIES" ]; then
+            echo "🔍 DETAILED FINDINGS:"
+            echo "$VULNERABILITIES"
+          else
+            echo "✅ No critical or high vulnerabilities found"
+          fi
+          
+          # Set outputs - Only fail on ACTUAL CRITICAL
+          echo "passed=$([ $TOTAL_CRITICAL -eq 0 ] && echo "true" || echo "false")" >> $GITHUB_OUTPUT
+          echo "critical_count=$TOTAL_CRITICAL" >> $GITHUB_OUTPUT
+          echo "high_count=$TOTAL_HIGH" >> $GITHUB_OUTPUT
+          
+          if [ $TOTAL_CRITICAL -gt 0 ]; then
+            echo "❌ Security Gate FAILED - $TOTAL_CRITICAL TRUE CRITICAL vulnerabilities found"
+            exit 1
+          else
+            echo "✅ Security Gate PASSED - Only $TOTAL_HIGH HIGH vulnerabilities (no CRITICAL)"
+          fi
+          
+  deploy-staging:
+    name: 🚀 Deploy to Staging (Heroku Docker)
+    runs-on: ubuntu-latest
+    needs: security-gate
+    if: github.ref == 'refs/heads/test' && needs.security-gate.outputs.passed == 'true'
+    steps:
+      - uses: actions/checkout@v4
+  
+      - name: Install Heroku CLI
+        run: |
+          curl https://cli-assets.heroku.com/install.sh | sh
+  
+      - name: Log in to Heroku Container Registry
+        run: echo "${{ secrets.HEROKU_API_KEY }}" | docker login --username=_ --password-stdin registry.heroku.com
+  
+      - name: Build Docker image
+        run: docker build -t registry.heroku.com/${{ secrets.HEROKU_APP_NAME_STAGING }}/web .
+  
+      - name: Push Docker image to Heroku
+        run: docker push registry.heroku.com/${{ secrets.HEROKU_APP_NAME_STAGING }}/web
+  
+      - name: Release app on Heroku
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_EMAIL: ${{ secrets.HEROKU_EMAIL }}
+          HEROKU_APP_NAME_STAGING: ${{ secrets.HEROKU_APP_NAME_STAGING }}
+        run: |
+          if [ -z "$HEROKU_APP_NAME_STAGING" ]; then
+            echo "❌ HEROKU_APP_NAME_STAGING is not set. Please configure it in GitHub Secrets."
+            exit 1
+          fi
+          echo "🚀 Releasing staging app on Heroku..."
+          heroku container:release web --app "$HEROKU_APP_NAME_STAGING"
+  
+  dast:
+    name: 🛡️ DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/test' && needs.deploy-staging.result == 'success'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+  
+      - name: Debug APP_URL_STAGING
+        run: |
+          echo "🔍 APP_URL_STAGING = $APP_URL"
+        env:
+          APP_URL: ${{ secrets.APP_URL_STAGING }}
+  
+      - name: Wait for application to be ready
+        run: |
+          echo "Waiting for Heroku app at $APP_URL ..."
+          for i in {1..30}; do
+            if curl --silent --fail "$APP_URL/actuator/health" > /dev/null; then
+              echo "✅ Application is ready"
+              exit 0
+            fi
+            echo "⏳ Attempt $i: Application not ready yet, waiting 10 seconds..."
+            sleep 10
+          done
+          echo "❌ Application failed to become ready within timeout"
+          exit 1
+        env:
+          APP_URL: ${{ secrets.APP_URL_STAGING }}
+  
+      - name: Run ZAP Baseline Scan
+        run: |
+          echo "🚀 Starting ZAP scan against $APP_URL ..."
+          set +e
+          docker run --rm -v $(pwd):/zap/wrk:rw \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t "$APP_URL" \
+            -a \
+            -m 10 \
+            -T 300 \
+            -r zap-report.html \
+            -w zap-report.md \
+            -J zap-report.json \
+            | tee zap-console.log
+          EXIT_CODE=$?
+          echo "ZAP finished with exit code: $EXIT_CODE"
+          echo "🔎 Filtering only High/Critical alerts..."
+          if grep -E "High|Critical" zap-console.log; then
+            echo "❌ High or Critical vulnerabilities found!"
+            exit 1
+          fi
+          set -e
+        env:
+          APP_URL: ${{ secrets.APP_URL_STAGING }}
+  
+      - name: Upload ZAP Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-dast-report
+          path: |
+            zap-console.log
+
+  deploy-production:
+    name: 🚀 Deploy to Production (Heroku Docker)
+    runs-on: ubuntu-latest
+    needs: security-gate
+    if: |
+      needs.security-gate.outputs.passed == 'true' &&
+      github.ref == 'refs/heads/main' 
+    steps:
+      - uses: actions/checkout@v4
+  
+      - name: Install Heroku CLI
+        run: |
+          curl https://cli-assets.heroku.com/install.sh | sh
+  
+      - name: Log in to Heroku Container Registry
+        run: echo "${{ secrets.HEROKU_API_KEY }}" | docker login --username=_ --password-stdin registry.heroku.com
+  
+      - name: Build Docker image
+        run: docker build -t registry.heroku.com/${{ secrets.HEROKU_APP_NAME }}/web .
+  
+      - name: Push Docker image to Heroku
+        run: docker push registry.heroku.com/${{ secrets.HEROKU_APP_NAME }}/web
+        
+      - name: Release app on Heroku
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_EMAIL: ${{ secrets.HEROKU_EMAIL }}
+          HEROKU_APP_NAME: ${{ secrets.HEROKU_APP_NAME }}
+        run: |
+          if [ -z "$HEROKU_APP_NAME" ]; then
+            echo "❌ HEROKU_APP_NAME is not set. Please configure it in GitHub Secrets."
+            exit 1
+          fi
+          echo "🚀 Releasing app on Heroku..."
+          heroku container:release web --app "$HEROKU_APP_NAME"
+
+  notify:
+    name: 📢 Notify Discord
+    runs-on: ubuntu-latest
+    needs: [sast, sca, container-scan, iac-scan, dast, security-gate, deploy-staging, deploy-production]
+    if: always()
+    steps:
+      - name: 📊 Tính trạng thái tổng thể
+        id: status
+        run: |
+          overall="SUCCESS"
+  
+          if [ "${{ needs.sast.result }}" = "failure" ] || \
+             [ "${{ needs.sca.result }}" = "failure" ] || \
+             [ "${{ needs.container-scan.result }}" = "failure" ] || \
+             [ "${{ needs.iac-scan.result }}" = "failure" ] || \
+             [ "${{ needs.dast.result }}" = "failure" ] || \
+             [ "${{ needs.security-gate.result }}" = "failure" ] || \
+             [ "${{ needs.deploy-staging.result }}" = "failure" ] || \
+             [ "${{ needs.deploy-production.result }}" = "failure" ]; then
+               overall="FAILED"
+          fi
+  
+          echo "overall=$overall" >> $GITHUB_OUTPUT
+  
+      - name: 📢 Gửi kết quả lên Discord
+        uses: Ilshidur/action-discord@master
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        with:
+          args: |
+            📢 **Pipeline Result** cho `${{ github.repository }}`
+            🔀 Branch: `${{ github.ref_name }}`
+            📌 Trạng thái tổng thể: **${{ steps.status.outputs.overall }}**
+  
+            **SAST:** ${{ needs.sast.result }}
+            **SCA:** ${{ needs.sca.result }}
+            **Container:** ${{ needs.container-scan.result }}
+            **IaC:** ${{ needs.iac-scan.result }}
+            **DAST:** ${{ needs.dast.result }}
+            **Security Gate:** ${{ needs.security-gate.result }}
+            **Staging Deploy:** ${{ needs.deploy-staging.result }}
+            **Production Deploy:** ${{ needs.deploy-production.result }}
+  
